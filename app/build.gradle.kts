@@ -77,6 +77,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // Tink, pulled in by security-crypto, references these annotations; include them so R8 can minify release builds.
+    implementation("com.google.code.findbugs:jsr305:3.0.2")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
