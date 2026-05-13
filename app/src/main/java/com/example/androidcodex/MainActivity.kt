@@ -3,6 +3,7 @@ package com.example.androidcodex
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.util.Base64
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -90,6 +91,9 @@ import androidx.security.crypto.MasterKey
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -220,6 +224,17 @@ class SecureCredentialStore(context: Context) {
 
     fun readField(providerId: String, field: String): String = prefs.getString("$providerId:$field", "").orEmpty()
 
+    fun savePendingCodexOAuth(verifier: String, state: String) {
+        prefs.edit()
+            .putString("codex:oauth:verifier", verifier)
+            .putString("codex:oauth:state", state)
+            .apply()
+    }
+
+    fun readPendingCodexVerifier(): String = prefs.getString("codex:oauth:verifier", "").orEmpty()
+
+    fun readPendingCodexState(): String = prefs.getString("codex:oauth:state", "").orEmpty()
+
     fun saveAuthProfile(providerId: String, profile: AuthImportResult) {
         prefs.edit()
             .putString(providerId, profile.secret)
@@ -239,6 +254,8 @@ class SecureCredentialStore(context: Context) {
             .remove("$providerId:endpoint")
             .remove("$providerId:model")
             .remove("$providerId:metadata")
+            .remove("$providerId:oauth:verifier")
+            .remove("$providerId:oauth:state")
             .apply()
     }
 }
@@ -300,20 +317,95 @@ private fun parseCodexOAuthImport(rawInput: String): AuthImportResult? {
 }
 
 
-private fun buildCodexOAuthUrl(): String {
-    val redirectUri = "codexhub://oauth/codex"
+
+private const val CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+private const val CODEX_REDIRECT_URI = "http://localhost:1455/auth/callback"
+
+private fun randomBase64Url(byteCount: Int = 32): String {
+    val bytes = ByteArray(byteCount)
+    SecureRandom().nextBytes(bytes)
+    return Base64.encodeToString(bytes, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+}
+
+private fun codeChallenge(verifier: String): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(verifier.toByteArray())
+    return Base64.encodeToString(digest, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+}
+
+private fun buildCodexOAuthUrl(credentialStore: SecureCredentialStore): String {
+    val verifier = randomBase64Url(64)
+    val state = randomBase64Url(24)
+    credentialStore.savePendingCodexOAuth(verifier, state)
     return Uri.Builder()
         .scheme("https")
         .authority("auth.openai.com")
         .appendPath("oauth")
         .appendPath("authorize")
         .appendQueryParameter("response_type", "code")
-        .appendQueryParameter("client_id", "codex-hub-android")
-        .appendQueryParameter("redirect_uri", redirectUri)
+        .appendQueryParameter("client_id", CODEX_CLIENT_ID)
+        .appendQueryParameter("redirect_uri", CODEX_REDIRECT_URI)
         .appendQueryParameter("scope", "openid profile email offline_access")
-        .appendQueryParameter("state", UUID.randomUUID().toString())
+        .appendQueryParameter("code_challenge", codeChallenge(verifier))
+        .appendQueryParameter("code_challenge_method", "S256")
+        .appendQueryParameter("id_token_add_organizations", "true")
+        .appendQueryParameter("codex_cli_simplified_flow", "true")
+        .appendQueryParameter("originator", "codex_android")
+        .appendQueryParameter("state", state)
         .build()
         .toString()
+}
+
+private fun formEncode(values: Map<String, String>): String = values.entries.joinToString("&") { (key, value) ->
+    "${URLEncoder.encode(key, "UTF-8") }=${URLEncoder.encode(value, "UTF-8") }"
+}
+
+private suspend fun exchangeCodexOAuthCallback(
+    callbackUrl: String,
+    credentialStore: SecureCredentialStore
+): AuthImportResult = withContext(Dispatchers.IO) {
+    val uri = Uri.parse(callbackUrl.trim())
+    val code = uri.getQueryParameter("code") ?: error("回调 URL 缺少 code 参数。")
+    val state = uri.getQueryParameter("state").orEmpty()
+    val expectedState = credentialStore.readPendingCodexState()
+    if (expectedState.isNotBlank() && state.isNotBlank() && state != expectedState) {
+        error("OAuth state 不匹配，请重新生成授权链接。")
+    }
+    val verifier = credentialStore.readPendingCodexVerifier().ifBlank {
+        error("缺少本次授权的 PKCE verifier，请先点击生成授权链接。")
+    }
+    val body = formEncode(
+        mapOf(
+            "grant_type" to "authorization_code",
+            "client_id" to CODEX_CLIENT_ID,
+            "code" to code,
+            "redirect_uri" to CODEX_REDIRECT_URI,
+            "code_verifier" to verifier
+        )
+    )
+    val connection = (URL("https://auth.openai.com/oauth/token").openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 20_000
+        readTimeout = 60_000
+        doOutput = true
+        setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
+    }
+    OutputStreamWriter(connection.outputStream).use { it.write(body) }
+    val responseCode = connection.responseCode
+    val response = (if (responseCode in 200..299) connection.inputStream else connection.errorStream)
+        .bufferedReader()
+        .use { it.readText() }
+    if (responseCode !in 200..299) error("Token 交换失败 HTTP $responseCode：$response")
+    val json = JSONObject(response)
+    val accessToken = json.optString("access_token").takeIf { it.isNotBlank() }
+        ?: error("Token 响应中没有 access_token。")
+    AuthImportResult(
+        mode = "codex-oauth-browser",
+        displayName = "Codex OAuth",
+        secret = accessToken,
+        endpoint = "https://api.openai.com/v1",
+        model = "gpt-5.5-codex",
+        metadata = "refresh_token=${json.optString("refresh_token")}; expires_in=${json.optString("expires_in") }"
+    )
 }
 
 private suspend fun callAiProvider(
@@ -722,6 +814,7 @@ private fun CodexOAuthImportPanel(
     connectedProviders: MutableMap<String, Boolean>
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var oauthPayload by rememberSaveable(provider.id) { mutableStateOf("") }
     var importMessage by rememberSaveable(provider.id) { mutableStateOf(credentialStore.readField(provider.id, "displayName")) }
     var generatedLink by rememberSaveable(provider.id) { mutableStateOf("") }
@@ -736,14 +829,14 @@ private fun CodexOAuthImportPanel(
                 Column(Modifier.weight(1f)) {
                     Text("Codex OAuth / Sub2API 导入", fontWeight = FontWeight.Bold)
                     Text(
-                        "先生成授权链接并在浏览器完成登录；浏览器回跳 codexhub://oauth/codex 时会自动导入，也可以手动粘贴回调 URL 上传。",
+                        "使用 Codex 官方客户端 ID 与 PKCE 生成链接；登录后浏览器会跳到 localhost，复制地址栏回调 URL 上传即可交换 token。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
                 Button(onClick = {
-                    generatedLink = buildCodexOAuthUrl()
+                    generatedLink = buildCodexOAuthUrl(credentialStore)
                     runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(generatedLink))) }
                         .onFailure { importMessage = "无法打开浏览器，请复制下方授权链接。" }
                 }) {
@@ -751,12 +844,13 @@ private fun CodexOAuthImportPanel(
                     Spacer(Modifier.width(8.dp))
                     Text("生成链接并打开浏览器")
                 }
-                TextButton(onClick = { generatedLink = buildCodexOAuthUrl() }) {
+                TextButton(onClick = { generatedLink = buildCodexOAuthUrl(credentialStore) }) {
                     Text("仅生成链接")
                 }
             }
             if (generatedLink.isNotBlank()) {
                 Text("授权链接：$generatedLink", style = MaterialTheme.typography.bodySmall)
+                Text("如果浏览器最后显示 localhost 无法打开，这是正常的：复制地址栏完整 URL，粘贴到下方上传回调。", style = MaterialTheme.typography.bodySmall)
             }
             OutlinedTextField(
                 value = oauthPayload,
@@ -771,14 +865,22 @@ private fun CodexOAuthImportPanel(
                 Button(
                     enabled = oauthPayload.isNotBlank(),
                     onClick = {
-                        val profile = parseCodexOAuthImport(oauthPayload)
-                        if (profile == null) {
-                            importMessage = "导入失败：未找到 refresh_token、access_token、code 或 token 字段。"
-                        } else {
-                            credentialStore.saveAuthProfile(provider.id, profile)
-                            connectedProviders[provider.id] = true
-                            importMessage = "已导入 ${profile.displayName} · ${profile.model}"
-                            oauthPayload = ""
+                        scope.launch {
+                            val profileResult = if (oauthPayload.contains("code=") && oauthPayload.contains("localhost:1455")) {
+                                runCatching { exchangeCodexOAuthCallback(oauthPayload, credentialStore) }
+                            } else {
+                                runCatching { parseCodexOAuthImport(oauthPayload) ?: error("未找到 refresh_token、access_token、code 或 token 字段。") }
+                            }
+                            profileResult
+                                .onSuccess { profile ->
+                                    credentialStore.saveAuthProfile(provider.id, profile)
+                                    connectedProviders[provider.id] = true
+                                    importMessage = "已导入 ${profile.displayName} · ${profile.model}"
+                                    oauthPayload = ""
+                                }
+                                .onFailure { error ->
+                                    importMessage = "导入失败：${error.message ?: error::class.java.simpleName}"
+                                }
                         }
                     }
                 ) {
