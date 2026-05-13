@@ -1,6 +1,7 @@
 package com.example.androidcodex
 
 import android.content.Context
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -83,6 +84,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.security.crypto.EncryptedSharedPreferences
+import org.json.JSONObject
 import androidx.security.crypto.MasterKey
 
 class MainActivity : ComponentActivity() {
@@ -96,7 +98,7 @@ class MainActivity : ComponentActivity() {
 }
 
 enum class AuthMode(val label: String) {
-    OAuth("授权登录"),
+    OAuth("Codex OAuth 导入"),
     ApiKey("Key 模式"),
     LocalBridge("本地桥接")
 }
@@ -123,13 +125,22 @@ data class WorkflowTemplate(
     val steps: List<String>
 )
 
+data class AuthImportResult(
+    val mode: String,
+    val displayName: String,
+    val secret: String,
+    val endpoint: String,
+    val model: String,
+    val metadata: String
+)
+
 private val supportedProviders = listOf(
     AiProvider(
         id = "codex",
         name = "Codex",
-        tagline = "支持授权登录，也支持 OpenAI API Key 模式。",
+        tagline = "支持像 Sub2API 一样导入 Codex OAuth，也支持 OpenAI API Key 模式。",
         modes = listOf(AuthMode.OAuth, AuthMode.ApiKey),
-        defaultModel = "codex-latest",
+        defaultModel = "gpt-5.5-codex",
         endpoint = "https://api.openai.com/v1",
         accent = "OpenAI"
     ),
@@ -189,9 +200,89 @@ class SecureCredentialStore(context: Context) {
 
     fun read(providerId: String): String = prefs.getString(providerId, "").orEmpty()
 
+    fun readField(providerId: String, field: String): String = prefs.getString("$providerId:$field", "").orEmpty()
+
     fun save(providerId: String, value: String) {
         prefs.edit().putString(providerId, value).apply()
     }
+
+    fun saveAuthProfile(providerId: String, profile: AuthImportResult) {
+        prefs.edit()
+            .putString(providerId, profile.secret)
+            .putString("$providerId:mode", profile.mode)
+            .putString("$providerId:displayName", profile.displayName)
+            .putString("$providerId:endpoint", profile.endpoint)
+            .putString("$providerId:model", profile.model)
+            .putString("$providerId:metadata", profile.metadata)
+            .apply()
+    }
+
+    fun clear(providerId: String) {
+        prefs.edit()
+            .remove(providerId)
+            .remove("$providerId:mode")
+            .remove("$providerId:displayName")
+            .remove("$providerId:endpoint")
+            .remove("$providerId:model")
+            .remove("$providerId:metadata")
+            .apply()
+    }
+}
+
+
+
+private fun JSONObject.findStringDeep(targetKeys: Set<String>): String? {
+    for (key in targetKeys) {
+        optString(key).takeIf { it.isNotBlank() }?.let { return it }
+    }
+    keys().asSequence().forEach { key ->
+        optJSONObject(key)?.findStringDeep(targetKeys)?.let { return it }
+    }
+    return null
+}
+
+private fun parseCodexOAuthImport(rawInput: String): AuthImportResult? {
+    val raw = rawInput.trim()
+    if (raw.isBlank()) return null
+
+    if (raw.startsWith("http://") || raw.startsWith("https://")) {
+        val uri = Uri.parse(raw)
+        val fragmentUri = uri.fragment?.let { Uri.parse("https://codex.local/?$it") }
+        fun readParam(key: String): String? = uri.getQueryParameter(key)
+            ?: fragmentUri?.getQueryParameter(key)
+
+        val token = listOf("refresh_token", "access_token", "code", "session", "token")
+            .firstNotNullOfOrNull { key -> readParam(key)?.takeIf { it.isNotBlank() } }
+            ?: raw
+        val account = readParam("account_id")
+            ?: readParam("org_id")
+            ?: readParam("email")
+            ?: uri.host.orEmpty()
+        return AuthImportResult(
+            mode = "codex-oauth-url",
+            displayName = account.ifBlank { "Codex OAuth URL" },
+            secret = token,
+            endpoint = readParam("base_url") ?: "https://api.openai.com/v1",
+            model = readParam("model") ?: "gpt-5.5-codex",
+            metadata = "Imported from OAuth callback URL"
+        )
+    }
+
+    return runCatching {
+        val json = JSONObject(raw)
+        val token = json.findStringDeep(setOf("refresh_token", "access_token", "id_token", "api_key", "token"))
+            ?: return null
+        val display = json.findStringDeep(setOf("account_id", "org_id", "email", "user", "name"))
+            ?: "Codex OAuth"
+        AuthImportResult(
+            mode = json.optString("mode", "codex-oauth-json"),
+            displayName = display,
+            secret = token,
+            endpoint = json.findStringDeep(setOf("base_url", "endpoint", "openai_base_url")) ?: "https://api.openai.com/v1",
+            model = json.findStringDeep(setOf("model", "default_model")) ?: "gpt-5.5-codex",
+            metadata = "Imported JSON keys: ${json.keys().asSequence().joinToString()}"
+        )
+    }.getOrNull()
 }
 
 @Composable
@@ -440,12 +531,8 @@ private fun ProviderCard(
                 ElevatedAssistChip(onClick = {}, label = { Text(provider.defaultModel) })
             }
             Text("Endpoint：${provider.endpoint}", style = MaterialTheme.typography.labelMedium)
-            if (AuthMode.OAuth in provider.modes) {
-                Button(onClick = { connectedProviders[provider.id] = true }) {
-                    Icon(Icons.Default.AccountCircle, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("使用 ${provider.name} 授权登录")
-                }
+            if (provider.id == "codex") {
+                CodexOAuthImportPanel(provider, credentialStore, connectedProviders)
             }
             OutlinedTextField(
                 value = keyValue,
@@ -464,7 +551,17 @@ private fun ProviderCard(
                 Button(
                     enabled = keyValue.isNotBlank(),
                     onClick = {
-                        credentialStore.save(provider.id, keyValue.trim())
+                        credentialStore.saveAuthProfile(
+                            provider.id,
+                            AuthImportResult(
+                                mode = "api-key",
+                                displayName = "${provider.name} API Key",
+                                secret = keyValue.trim(),
+                                endpoint = provider.endpoint,
+                                model = provider.defaultModel,
+                                metadata = "Manual API key entry"
+                            )
+                        )
                         connectedProviders[provider.id] = true
                         keyValue = ""
                     }
@@ -474,12 +571,109 @@ private fun ProviderCard(
                     Text("保存 Key")
                 }
                 TextButton(onClick = {
-                    credentialStore.save(provider.id, "")
+                    credentialStore.clear(provider.id)
                     connectedProviders[provider.id] = false
                 }) {
                     Text("断开")
                 }
             }
+            ProviderRuntimeCard(provider, credentialStore)
+        }
+    }
+}
+
+
+@Composable
+private fun ProviderRuntimeCard(provider: AiProvider, credentialStore: SecureCredentialStore) {
+    val mode = credentialStore.readField(provider.id, "mode").ifBlank { "未配置" }
+    val endpoint = credentialStore.readField(provider.id, "endpoint").ifBlank { provider.endpoint }
+    val model = credentialStore.readField(provider.id, "model").ifBlank { provider.defaultModel }
+    val snippet = when (provider.id) {
+        "codex" -> "OPENAI_BASE_URL=$endpoint\nCODEX_AUTH_MODE=$mode\nCODEX_MODEL=$model"
+        "claude-code" -> "ANTHROPIC_BASE_URL=$endpoint\nANTHROPIC_MODEL=$model\nCLAUDE_CODE_USE_BEDROCK=0"
+        "deepseek" -> "OPENAI_BASE_URL=$endpoint\nOPENAI_MODEL=$model\nDEEPSEEK_COMPATIBLE=true"
+        else -> "AI_BASE_URL=$endpoint\nAI_MODEL=$model"
+    }
+
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f))) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("运行配置", fontWeight = FontWeight.Bold)
+            Text("认证模式：$mode", style = MaterialTheme.typography.bodySmall)
+            Text("Endpoint：$endpoint", style = MaterialTheme.typography.bodySmall)
+            Text("Model：$model", style = MaterialTheme.typography.bodySmall)
+            Text(snippet, style = MaterialTheme.typography.labelSmall)
+        }
+    }
+}
+
+
+@Composable
+private fun CodexOAuthImportPanel(
+    provider: AiProvider,
+    credentialStore: SecureCredentialStore,
+    connectedProviders: MutableMap<String, Boolean>
+) {
+    var oauthPayload by rememberSaveable(provider.id) { mutableStateOf("") }
+    var importMessage by rememberSaveable(provider.id) { mutableStateOf(credentialStore.readField(provider.id, "displayName")) }
+    val activeMode = credentialStore.readField(provider.id, "mode")
+    val activeModel = credentialStore.readField(provider.id, "model").ifBlank { provider.defaultModel }
+
+    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.AccountCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Codex OAuth / Sub2API 导入", fontWeight = FontWeight.Bold)
+                    Text(
+                        "粘贴 Codex OAuth JSON、auth.json 片段或 OAuth 回调 URL，App 会提取 token、账号、模型和兼容接口地址。",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+            OutlinedTextField(
+                value = oauthPayload,
+                onValueChange = { oauthPayload = it },
+                modifier = Modifier.fillMaxWidth(),
+                minLines = 4,
+                label = { Text("OAuth JSON / 回调 URL / Sub2API 导出") },
+                placeholder = { Text("例如：{\"refresh_token\":\"...\",\"account_id\":\"...\",\"model\":\"gpt-5.5-codex\"}") },
+                visualTransformation = PasswordVisualTransformation()
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(
+                    enabled = oauthPayload.isNotBlank(),
+                    onClick = {
+                        val profile = parseCodexOAuthImport(oauthPayload)
+                        if (profile == null) {
+                            importMessage = "导入失败：未找到 refresh_token、access_token、code 或 token 字段。"
+                        } else {
+                            credentialStore.saveAuthProfile(provider.id, profile)
+                            connectedProviders[provider.id] = true
+                            importMessage = "已导入 ${profile.displayName} · ${profile.model}"
+                            oauthPayload = ""
+                        }
+                    }
+                ) {
+                    Icon(Icons.Default.AccountCircle, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("导入 OAuth")
+                }
+                TextButton(onClick = {
+                    oauthPayload = ""
+                    importMessage = "可重新粘贴最新 OAuth 导出内容。"
+                }) {
+                    Text("清空输入")
+                }
+            }
+            Text(
+                text = if (importMessage.isNotBlank()) "状态：$importMessage" else "当前：${activeMode.ifBlank { "未导入 OAuth" }} · $activeModel",
+                style = MaterialTheme.typography.labelMedium
+            )
+            Text(
+                text = "兼容调用：Authorization: Bearer <导入的 OAuth token>，Base URL 默认为 ${provider.endpoint}，也可由导入内容覆盖。",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
     }
 }
