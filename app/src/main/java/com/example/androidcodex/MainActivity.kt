@@ -1,6 +1,7 @@
 package com.example.androidcodex
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -73,6 +74,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -84,16 +86,32 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.security.crypto.EncryptedSharedPreferences
-import org.json.JSONObject
 import androidx.security.crypto.MasterKey
+import java.io.OutputStreamWriter
+import java.net.HttpURLConnection
+import java.net.URL
+import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
+    private val oauthCallbackUri = mutableStateOf<Uri?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        oauthCallbackUri.value = intent?.data
         enableEdgeToEdge()
         setContent {
-            CodexHubApp()
+            CodexHubApp(callbackUri = oauthCallbackUri.value)
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        oauthCallbackUri.value = intent.data
     }
 }
 
@@ -202,10 +220,6 @@ class SecureCredentialStore(context: Context) {
 
     fun readField(providerId: String, field: String): String = prefs.getString("$providerId:$field", "").orEmpty()
 
-    fun save(providerId: String, value: String) {
-        prefs.edit().putString(providerId, value).apply()
-    }
-
     fun saveAuthProfile(providerId: String, profile: AuthImportResult) {
         prefs.edit()
             .putString(providerId, profile.secret)
@@ -285,8 +299,84 @@ private fun parseCodexOAuthImport(rawInput: String): AuthImportResult? {
     }.getOrNull()
 }
 
+
+private fun buildCodexOAuthUrl(): String {
+    val redirectUri = "codexhub://oauth/codex"
+    return Uri.Builder()
+        .scheme("https")
+        .authority("auth.openai.com")
+        .appendPath("oauth")
+        .appendPath("authorize")
+        .appendQueryParameter("response_type", "code")
+        .appendQueryParameter("client_id", "codex-hub-android")
+        .appendQueryParameter("redirect_uri", redirectUri)
+        .appendQueryParameter("scope", "openid profile email offline_access")
+        .appendQueryParameter("state", UUID.randomUUID().toString())
+        .build()
+        .toString()
+}
+
+private suspend fun callAiProvider(
+    provider: AiProvider,
+    credentialStore: SecureCredentialStore,
+    prompt: String
+): String = withContext(Dispatchers.IO) {
+    val token = credentialStore.read(provider.id)
+    require(token.isNotBlank()) { "请先在模型页完成 ${provider.name} 授权或保存 API Key。" }
+    val endpoint = credentialStore.readField(provider.id, "endpoint").ifBlank { provider.endpoint }
+    val model = credentialStore.readField(provider.id, "model").ifBlank { provider.defaultModel }
+    val url = if (provider.id == "claude-code") {
+        URL("${endpoint.trimEnd('/')}/messages")
+    } else {
+        URL("${endpoint.trimEnd('/')}/chat/completions")
+    }
+    val body = if (provider.id == "claude-code") {
+        JSONObject()
+            .put("model", model)
+            .put("max_tokens", 1200)
+            .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
+    } else {
+        JSONObject()
+            .put("model", model)
+            .put(
+                "messages",
+                JSONArray()
+                    .put(JSONObject().put("role", "system").put("content", "You are a mobile coding agent. Answer concisely with implementation steps and code guidance."))
+                    .put(JSONObject().put("role", "user").put("content", prompt))
+            )
+    }
+
+    val connection = (url.openConnection() as HttpURLConnection).apply {
+        requestMethod = "POST"
+        connectTimeout = 20_000
+        readTimeout = 60_000
+        doOutput = true
+        setRequestProperty("Content-Type", "application/json")
+        if (provider.id == "claude-code") {
+            setRequestProperty("x-api-key", token)
+            setRequestProperty("anthropic-version", "2023-06-01")
+        } else {
+            setRequestProperty("Authorization", "Bearer $token")
+        }
+    }
+    OutputStreamWriter(connection.outputStream).use { it.write(body.toString()) }
+    val responseCode = connection.responseCode
+    val response = (if (responseCode in 200..299) connection.inputStream else connection.errorStream)
+        .bufferedReader()
+        .use { it.readText() }
+    if (responseCode !in 200..299) return@withContext "请求失败 HTTP $responseCode：$response"
+    val json = JSONObject(response)
+    if (provider.id == "claude-code") {
+        json.optJSONArray("content")?.optJSONObject(0)?.optString("text")?.takeIf { it.isNotBlank() }
+            ?: response
+    } else {
+        json.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")?.optString("content")?.takeIf { it.isNotBlank() }
+            ?: response
+    }
+}
+
 @Composable
-fun CodexHubApp() {
+fun CodexHubApp(callbackUri: Uri? = null) {
     val context = LocalContext.current
     val colors = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         androidx.compose.material3.dynamicLightColorScheme(context)
@@ -298,7 +388,7 @@ fun CodexHubApp() {
         colorScheme = colors
     ) {
         Surface(modifier = Modifier.fillMaxSize()) {
-            CodexHubHome()
+            CodexHubHome(callbackUri)
         }
     }
 }
@@ -312,7 +402,7 @@ private enum class AppTab(val label: String, val icon: ImageVector) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CodexHubHome() {
+private fun CodexHubHome(callbackUri: Uri?) {
     var selectedTab by rememberSaveable { mutableStateOf(AppTab.Chat) }
     val context = LocalContext.current
     val credentialStore = remember { SecureCredentialStore(context) }
@@ -321,6 +411,14 @@ private fun CodexHubHome() {
     LaunchedEffect(Unit) {
         supportedProviders.forEach { provider ->
             connectedProviders[provider.id] = credentialStore.read(provider.id).isNotBlank()
+        }
+    }
+    LaunchedEffect(callbackUri) {
+        callbackUri?.let { uri ->
+            parseCodexOAuthImport(uri.toString())?.let { profile ->
+                credentialStore.saveAuthProfile("codex", profile)
+                connectedProviders["codex"] = true
+            }
         }
     }
 
@@ -384,6 +482,10 @@ private fun ChatScreen(connectedProviders: Map<String, Boolean>) {
     }
     val provider = supportedProviders.first { it.id == selectedProvider }
     val isConnected = connectedProviders[selectedProvider] == true
+    val context = LocalContext.current
+    val credentialStore = remember { SecureCredentialStore(context) }
+    val scope = rememberCoroutineScope()
+    var isSending by rememberSaveable { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -418,12 +520,18 @@ private fun ChatScreen(connectedProviders: Map<String, Boolean>) {
                         onClick = {
                             val userPrompt = prompt.trim()
                             messages += ChatMessage("你", userPrompt, false)
-                            messages += ChatMessage(
-                                provider.name,
-                                buildAssistantPreview(provider, userPrompt, isConnected),
-                                true
-                            )
                             prompt = ""
+                            if (!isConnected) {
+                                messages += ChatMessage(provider.name, buildAssistantPreview(provider, userPrompt, false), true)
+                            } else {
+                                isSending = true
+                                scope.launch {
+                                    val answer = runCatching { callAiProvider(provider, credentialStore, userPrompt) }
+                                        .getOrElse { error -> "调用失败：${error.message ?: error::class.java.simpleName}" }
+                                    messages += ChatMessage(provider.name, answer, true)
+                                    isSending = false
+                                }
+                            }
                         }
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
@@ -432,7 +540,7 @@ private fun ChatScreen(connectedProviders: Map<String, Boolean>) {
             )
             Spacer(Modifier.height(8.dp))
             Text(
-                text = if (isConnected) "${provider.name} 已配置，可接入真实后端。" else "${provider.name} 尚未配置，当前展示离线任务规划预览。",
+                text = if (isSending) "${provider.name} 正在回复…" else if (isConnected) "${provider.name} 已配置，正在使用真实接口聊天。" else "${provider.name} 尚未配置，当前展示离线任务规划预览。",
                 style = MaterialTheme.typography.labelMedium,
                 color = if (isConnected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
             )
@@ -613,8 +721,10 @@ private fun CodexOAuthImportPanel(
     credentialStore: SecureCredentialStore,
     connectedProviders: MutableMap<String, Boolean>
 ) {
+    val context = LocalContext.current
     var oauthPayload by rememberSaveable(provider.id) { mutableStateOf("") }
     var importMessage by rememberSaveable(provider.id) { mutableStateOf(credentialStore.readField(provider.id, "displayName")) }
+    var generatedLink by rememberSaveable(provider.id) { mutableStateOf("") }
     val activeMode = credentialStore.readField(provider.id, "mode")
     val activeModel = credentialStore.readField(provider.id, "model").ifBlank { provider.defaultModel }
 
@@ -626,17 +736,34 @@ private fun CodexOAuthImportPanel(
                 Column(Modifier.weight(1f)) {
                     Text("Codex OAuth / Sub2API 导入", fontWeight = FontWeight.Bold)
                     Text(
-                        "粘贴 Codex OAuth JSON、auth.json 片段或 OAuth 回调 URL，App 会提取 token、账号、模型和兼容接口地址。",
+                        "先生成授权链接并在浏览器完成登录；浏览器回跳 codexhub://oauth/codex 时会自动导入，也可以手动粘贴回调 URL 上传。",
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Button(onClick = {
+                    generatedLink = buildCodexOAuthUrl()
+                    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(generatedLink))) }
+                        .onFailure { importMessage = "无法打开浏览器，请复制下方授权链接。" }
+                }) {
+                    Icon(Icons.Default.AccountCircle, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("生成链接并打开浏览器")
+                }
+                TextButton(onClick = { generatedLink = buildCodexOAuthUrl() }) {
+                    Text("仅生成链接")
+                }
+            }
+            if (generatedLink.isNotBlank()) {
+                Text("授权链接：$generatedLink", style = MaterialTheme.typography.bodySmall)
             }
             OutlinedTextField(
                 value = oauthPayload,
                 onValueChange = { oauthPayload = it },
                 modifier = Modifier.fillMaxWidth(),
                 minLines = 4,
-                label = { Text("OAuth JSON / 回调 URL / Sub2API 导出") },
+                label = { Text("上传回调 URL / OAuth JSON / Sub2API 导出") },
                 placeholder = { Text("例如：{\"refresh_token\":\"...\",\"account_id\":\"...\",\"model\":\"gpt-5.5-codex\"}") },
                 visualTransformation = PasswordVisualTransformation()
             )
@@ -657,7 +784,7 @@ private fun CodexOAuthImportPanel(
                 ) {
                     Icon(Icons.Default.AccountCircle, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
-                    Text("导入 OAuth")
+                    Text("上传回调并导入")
                 }
                 TextButton(onClick = {
                     oauthPayload = ""
